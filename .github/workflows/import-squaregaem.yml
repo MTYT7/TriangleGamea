@@ -1,0 +1,31 @@
+name: Import squareGaem into TriangleGamea
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out TriangleGamea
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Import the friend's project
+        run: |
+          git clone --depth 1 https://github.com/IstoleyoursandwichRBLX/squareGaem.git /tmp/squareGaem
+          rsync -a --exclude='.git' /tmp/squareGaem/ ./
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No imported changes to commit."
+            exit 0
+          fi
+          git commit -m "Import squareGaem project as TriangleGamea base"
+          git push
