@@ -28,9 +28,10 @@ jobs:
       - name: Build browser game archive
         run: python -m pygbag --build --PYBUILD 3.12 --app_name squaregame --package squaregame --title "Triangle Game" --ume_block 1 --disable-sound-format-error .
 
-      - name: Publish browser archive as a GitHub Release asset
+      - name: Publish versioned browser archive
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APK_NAME: squaregame-${{ github.sha }}.apk
         run: |
           APK_PATH="$(find build/web -maxdepth 1 -type f -name '*.apk' -print -quit)"
           if [ -z "$APK_PATH" ]; then
@@ -38,17 +39,22 @@ jobs:
             ls -lah build/web
             exit 1
           fi
-          cp "$APK_PATH" squaregame.apk
+          cp "$APK_PATH" "$APK_NAME"
           if ! gh release view browser-build >/dev/null 2>&1; then
-            gh release create browser-build --title "Triangle Game browser build" --notes "Automatically built browser game archive."
+            gh release create browser-build --title "Triangle Game browser builds" --notes "Versioned browser game archives."
           fi
-          gh release upload browser-build squaregame.apk --clobber
+          gh release upload browser-build "$APK_NAME"
 
           python - <<'PY'
+          import os
+          import re
           from pathlib import Path
           p = Path("docs/index.html")
           s = p.read_text(encoding="utf-8")
-          s = s.replace('apk = "squaregame.apk"', 'apk = "https://github.com/MTYT7/TriangleGamea/releases/download/browser-build/squaregame.apk"')
+          apk_url = f"https://github.com/MTYT7/TriangleGamea/releases/download/browser-build/{os.environ['APK_NAME']}"
+          s, count = re.subn(r'apk = "[^"]+"', f'apk = "{apk_url}"', s, count=1)
+          if count != 1:
+              raise SystemExit("Could not locate the Pygbag APK URL in docs/index.html")
           s = s.replace("Loading squaregame from squaregame.apk", "Loading Triangle Game")
           s = s.replace('<title>squaregame</title>', '<title>Triangle Game</title>')
           s = s.replace('Title   : squaregame', 'Title   : Triangle Game')
