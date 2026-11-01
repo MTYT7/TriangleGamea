@@ -12,7 +12,7 @@ import cloud
 
 pygame.init()
 screen = pygame.display.set_mode((1920, 980))
-pygame.display.set_caption("Triangle Game")
+pygame.display.set_caption("Square Game")
 
 pygame.mixer.init()
 
@@ -24,7 +24,7 @@ clock = pygame.time.Clock()
 mainFont = pygame.font.Font("Things/Fonts/PressStart2P.ttf", 50)
 smallFont = pygame.font.Font("Things/Fonts/PressStart2P.ttf", 28)
 enemyIndexButtonFont = pygame.font.Font("Things/Fonts/PressStart2P.ttf", 24)
-mainText = mainFont.render("Triangle Game", False, "White")
+mainText = mainFont.render("Square Game", False, "White")
 
 textTarget = (670, 200)
 buttonTarget = pygame.Rect(740, 500, 400, 120)
@@ -84,9 +84,8 @@ def makeButton(surface, rect, text, mousePos, scale, alpha = 255, font = mainFon
 
 def createSquareSurface(color, size):
     surface = pygame.Surface((size, size), pygame.SRCALPHA)
-    points = [(size / 2, 0), (size, size), (0, size)]
-    pygame.draw.polygon(surface, color, points)
-    pygame.draw.polygon(surface, (255, 255, 255), points, width = 6)
+    pygame.draw.rect(surface, color, (0, 0, size, size))
+    pygame.draw.rect(surface, (255, 255, 255), (0, 0, size, size), width = 6)
     return surface
 
 def lerp(start, end, t):
@@ -113,7 +112,7 @@ def tryParseRGB(text):
     return None
 
 async def checkPassword():
-    correctPassword = "TR"
+    correctPassword = "squaregamea"
     inputText = ""
     errorMessage = ""
 

@@ -19,9 +19,8 @@ def createChargerSurface(size):
     intSize = int(size)
     surface = pygame.Surface((intSize, intSize), pygame.SRCALPHA)
 
-    points = [(intSize / 2, 0), (intSize, intSize), (0, intSize)]
-    pygame.draw.polygon(surface, (20, 20, 140), points)
-    pygame.draw.polygon(surface, (255, 255, 255), points, width = 6)
+    pygame.draw.rect(surface, (20, 20, 140), (0, 0, intSize, intSize))
+    pygame.draw.rect(surface, (255, 255, 255), (0, 0, intSize, intSize), width = 6)
 
     return surface
 
