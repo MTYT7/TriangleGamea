@@ -28,31 +28,38 @@ jobs:
       - name: Build browser game archive
         run: python -m pygbag --build --PYBUILD 3.12 --app_name squaregame --package squaregame --title "Triangle Game" --ume_block 1 --disable-sound-format-error .
 
-      - name: Publish rebuilt archive to GitHub Pages
+      - name: Publish browser archive as a GitHub Release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           APK_PATH="$(find build/web -maxdepth 1 -type f -name '*.apk' -print -quit)"
           if [ -z "$APK_PATH" ]; then
-            echo "No APK archive was produced. Contents of build/web:"
+            echo "No APK archive was produced."
             ls -lah build/web
             exit 1
           fi
-          echo "Publishing $APK_PATH"
-          cp "$APK_PATH" docs/squaregame.apk
+          cp "$APK_PATH" squaregame.apk
+          if ! gh release view browser-build >/dev/null 2>&1; then
+            gh release create browser-build --title "Triangle Game browser build" --notes "Automatically built browser game archive."
+          fi
+          gh release upload browser-build squaregame.apk --clobber
+
           python - <<'PY'
           from pathlib import Path
           p = Path("docs/index.html")
           s = p.read_text(encoding="utf-8")
+          s = s.replace('apk = "squaregame.apk"', 'apk = "https://github.com/MTYT7/TriangleGamea/releases/download/browser-build/squaregame.apk"')
           s = s.replace("Loading squaregame from squaregame.apk", "Loading Triangle Game")
           s = s.replace('<title>squaregame</title>', '<title>Triangle Game</title>')
           s = s.replace('Title   : squaregame', 'Title   : Triangle Game')
           p.write_text(s, encoding="utf-8")
           PY
-          if git diff --quiet -- docs/squaregame.apk docs/index.html; then
-            echo "No published changes."
+          if git diff --quiet -- docs/index.html; then
+            echo "No HTML changes to publish."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/squaregame.apk docs/index.html
-          git commit -m "Build and publish Triangle Game"
+          git add docs/index.html
+          git commit -m "Update Triangle Game browser loader"
           git push
