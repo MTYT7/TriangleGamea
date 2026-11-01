@@ -68,10 +68,9 @@ upgradeDefinitions = {
 
 def createSquareSurface(color, size):
     surface = pygame.Surface((size, size), pygame.SRCALPHA)
-
-    pygame.draw.rect(surface, color, (0, 0, size, size))
-    pygame.draw.rect(surface, (255, 255, 255), (0, 0, size, size), width = 6)
-    
+    points = [(size / 2, 0), (size, size), (0, size)]
+    pygame.draw.polygon(surface, color, points)
+    pygame.draw.polygon(surface, (255, 255, 255), points, width = 6)
     return surface
 
 def renderCachedText(cache, key, font, text, color):
