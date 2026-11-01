@@ -30,8 +30,14 @@ jobs:
 
       - name: Publish rebuilt archive to GitHub Pages
         run: |
-          test -f build/web/squaregame.apk
-          cp build/web/squaregame.apk docs/squaregame.apk
+          APK_PATH="$(find build/web -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          if [ -z "$APK_PATH" ]; then
+            echo "No APK archive was produced. Contents of build/web:"
+            ls -lah build/web
+            exit 1
+          fi
+          echo "Publishing $APK_PATH"
+          cp "$APK_PATH" docs/squaregame.apk
           python - <<'PY'
           from pathlib import Path
           p = Path("docs/index.html")
