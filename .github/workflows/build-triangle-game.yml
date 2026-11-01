@@ -1,0 +1,52 @@
+name: Build and publish Triangle Game
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Pygbag
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pygbag
+
+      - name: Build browser game archive
+        run: python -m pygbag --build --PYBUILD 3.12 --app_name squaregame --package squaregame --title "Triangle Game" --ume_block 1 .
+
+      - name: Publish rebuilt archive to GitHub Pages
+        run: |
+          test -f build/web/squaregame.apk
+          cp build/web/squaregame.apk docs/squaregame.apk
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("docs/index.html")
+          s = p.read_text(encoding="utf-8")
+          s = s.replace("Loading squaregame from squaregame.apk", "Loading Triangle Game")
+          s = s.replace('<title>squaregame</title>', '<title>Triangle Game</title>')
+          s = s.replace('Title   : squaregame', 'Title   : Triangle Game')
+          p.write_text(s, encoding="utf-8")
+          PY
+          if git diff --quiet -- docs/squaregame.apk docs/index.html; then
+            echo "No published changes."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/squaregame.apk docs/index.html
+          git commit -m "Build and publish Triangle Game"
+          git push
