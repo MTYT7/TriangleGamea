@@ -1,0 +1,1717 @@
+import pygame
+import sys
+import random
+import asyncio
+import json
+import cloud
+
+from Things.Enemies import shooters as enemyModule
+from Things.Enemies import chargers as chargerModule
+from Things.Enemies import Iceman as icemanModule
+
+import statuses
+import math
+import dialogue
+import health as healthBar
+
+moveSpeed = 6
+baseEnemySpeed = moveSpeed * 0.75
+hudTextCache = {}
+
+currentUser = None
+
+def saveStorageKey():
+    if currentUser:
+        return f"squareGameSave_{currentUser.lower()}"
+    return "squareGameSave"
+
+def saveGameData(wave, money, ownedUpgrades):
+    cloud.put(saveStorageKey(), {
+        "wave": wave + 1,
+        "money": money,
+        "upgrades": list(ownedUpgrades)
+    })
+
+def loadGameData():
+    return cloud.get(saveStorageKey(), None)
+
+def hasSaveGame():
+    return loadGameData() is not None
+
+upgradeDefinitions = {
+    "betterDashes": {
+        "name": "Better Dashes",
+        "cost": 50,
+        "description": ["Faster Dash and", "Shorter Cooldown"]
+    },
+    "betterFists": {
+        "name": "Better Fists",
+        "cost": 50,
+        "description": ["Increased Damage", "Can Parry Bullets"]
+    },
+    "betterBullets": {
+        "name": "Better Bullets",
+        "cost": 50,
+        "description": ["Bullets Knockback Enemies", "and have a faster firerate"]
+    },
+    "electricDashes": {
+        "name": "Electric Dashes",
+        "cost": 75,
+        "description": ["Dash Teleports You", "Electric Field Behind Dash"]
+    },
+    "umbrella": {
+        "name": "Umbrella",
+        "cost": 100,
+        "description": ["Replaces Fists with Umbrella.", "Press R to Change Modes"]
+    }
+}
+
+def createSquareSurface(color, size):
+    surface = pygame.Surface((size, size), pygame.SRCALPHA)
+
+    pygame.draw.rect(surface, color, (0, 0, size, size))
+    pygame.draw.rect(surface, (255, 255, 255), (0, 0, size, size), width = 6)
+    
+    return surface
+
+def renderCachedText(cache, key, font, text, color):
+    cached = cache.get(key)
+    if cached is not None and cached[0] == text:
+        return cached[1]
+
+    surface = font.render(text, True, color)
+    cache[key] = (text, surface)
+    return surface
+
+def buildCardSurface(width, height, titleFont, bodyFont, name = None, cost = None, descriptionLines = None, owned = False):
+    cardSurf = pygame.Surface((width, height), pygame.SRCALPHA)
+
+    pygame.draw.rect(cardSurf, (40, 40, 40, 255), (0, 0, width, height), border_radius=20)
+    pygame.draw.rect(cardSurf, (255, 255, 255, 255), (0, 0, width, height), width=4, border_radius=20)
+
+    if name:
+        nameSurface = titleFont.render(name, True, (255, 255, 255))
+        nameRect = nameSurface.get_rect(center = (width // 2, 55))
+        cardSurf.blit(nameSurface, nameRect)
+
+    if descriptionLines:
+        maxTextWidth = width - 30
+        wrappedLines = []
+
+        for line in descriptionLines:
+            wrappedLines.extend(wrapText(bodyFont, line, maxTextWidth))
+
+        lineSpacing = 24
+        startY = height // 2 - (len(wrappedLines) * lineSpacing) // 2
+
+        for i, line in enumerate(wrappedLines):
+            lineSurface = bodyFont.render(line, True, (200, 200, 200))
+            lineRect = lineSurface.get_rect(center = (width // 2, startY + i * lineSpacing))
+            cardSurf.blit(lineSurface, lineRect)
+
+    if cost is not None:
+        costColor = (150, 150, 150) if owned else (120, 220, 120)
+        costText = "Owned" if owned else f"£{cost}"
+        costSurface = bodyFont.render(costText, True, costColor)
+        costRect = costSurface.get_rect(center=(width // 2, height - 40))
+        cardSurf.blit(costSurface, costRect)
+
+    return cardSurf
+
+def buildSimpleButtonSurface(width, height, font, text):
+    buttonSurf = pygame.Surface((width, height), pygame.SRCALPHA)
+
+    pygame.draw.rect(buttonSurf, (40, 40, 40, 255), (0, 0, width, height), border_radius = 16)
+    pygame.draw.rect(buttonSurf, (255, 255, 255, 255), (0, 0, width, height), width = 4, border_radius = 16)
+
+    textSurface = font.render(text, True, (255, 255, 255))
+    textRect = textSurface.get_rect(center=(width // 2, height // 2))
+    buttonSurf.blit(textSurface, textRect)
+
+    return buttonSurf
+
+def blitScaledCard(surface, baseSurf, rect, alpha, scale):
+    baseSurf.set_alpha(alpha)
+
+    scaledWidth = max(1, int(rect.width * scale))
+    scaledHeight = max(1, int(rect.height * scale))
+    scaledSurf = pygame.transform.scale(baseSurf, (scaledWidth, scaledHeight))
+
+    scaledRect = scaledSurf.get_rect(center=rect.center)
+    surface.blit(scaledSurf, scaledRect)
+
+def wrapText(font, text, maxWidth):
+    words = text.split(" ")
+    lines = []
+    currentLine = ""
+
+    for word in words:
+        testLine = (currentLine + " " + word).strip()
+        if font.size(testLine)[0] <= maxWidth:
+            currentLine = testLine
+        else:
+            if currentLine:
+                lines.append(currentLine)
+            currentLine = word
+
+    if currentLine:
+        lines.append(currentLine)
+
+    return lines
+
+def lerp(start, end, t):
+    return start + (end - start) * t
+
+def pointToSegmentDistanceSquared(px, py, x1, y1, x2, y2):
+    dx = x2 - x1
+    dy = y2 - y1
+    lengthSquared = dx * dx + dy * dy
+
+    if lengthSquared == 0:
+        return (px - x1) ** 2 + (py - y1) ** 2
+
+    t = ((px - x1) * dx + (py - y1) * dy) / lengthSquared
+    t = max(0, min(1, t))
+
+    closestX = x1 + t * dx
+    closestY = y1 + t * dy
+
+    return (px - closestX) ** 2 + (py - closestY) ** 2
+
+def generateLightningPoints(x1, y1, x2, y2, segments, jaggedness, seed):
+    rng = random.Random(seed)
+
+    dx = x2 - x1
+    dy = y2 - y1
+    length = math.sqrt(dx * dx + dy * dy)
+
+    if length == 0:
+        return [(x1, y1), (x2, y2)]
+
+    normalX = -dy / length
+    normalY = dx / length
+
+    points = [(x1, y1)]
+
+    for i in range(1, segments):
+        t = i / segments
+        baseX = x1 + dx * t
+        baseY = y1 + dy * t
+        offset = rng.uniform(-jaggedness, jaggedness)
+        points.append((baseX + normalX * offset, baseY + normalY * offset))
+
+    points.append((x2, y2))
+    return points
+
+def easeOut(t):
+    return 1 - (1 - t) * (1 - t)
+
+def renderTextWithOutline(font, text, textColor, outlineColor, outlineWidth = 2):
+    textSurface = font.render(text, True, textColor)
+    outlineSurface = pygame.Surface(
+        (textSurface.get_width() + outlineWidth * 2, textSurface.get_height() + outlineWidth * 2),
+        pygame.SRCALPHA
+    )
+
+    for dx in range(-outlineWidth, outlineWidth + 1):
+        for dy in range(-outlineWidth, outlineWidth + 1):
+            if dx != 0 or dy != 0:
+                outlineText = font.render(text, True, outlineColor)
+                outlineSurface.blit(outlineText, (dx + outlineWidth, dy + outlineWidth))
+
+    outlineSurface.blit(textSurface, (outlineWidth, outlineWidth))
+    return outlineSurface
+
+deathFrames = None
+
+async def loadDeathFrames(screen):
+    global deathFrames
+    if deathFrames is not None:
+        return
+
+    framesPath = "Things/Videos/deathframes"
+    deathFrames = []
+    font = pygame.font.Font("Things/Fonts/PressStart2P.ttf", 30)
+
+    try:
+        import os
+        frameFiles = sorted(os.listdir(framesPath))
+        total = len(frameFiles)
+
+        for i, filename in enumerate(frameFiles):
+            frame = pygame.image.load(f"{framesPath}/{filename}").convert()
+            frame = pygame.transform.scale(frame, (screen.get_width(), screen.get_height()))
+            deathFrames.append(frame)
+
+            screen.fill((20, 20, 20))
+            text = font.render(f"Loading... {i + 1}/{total}", True, (255, 255, 255))
+            screen.blit(text, text.get_rect(center=screen.get_rect().center))
+            pygame.display.update()
+
+            await asyncio.sleep(0)
+    except:
+        deathFrames = []
+
+async def die(screen, color):
+    global deathFrames
+    frames = deathFrames if deathFrames else []
+
+    clock = pygame.time.Clock()
+    frameIndex = 0
+    font = pygame.font.Font("Things/Fonts/PressStart2P.ttf", 50)
+    retryFont = pygame.font.Font("Things/Fonts/PressStart2P.ttf", 70)
+
+    deathScreenStart = pygame.time.get_ticks()
+    retryTextDelay = 1000
+    retryFadeDuration = 500
+    retryAlpha = 0
+    retryTextSurface = renderTextWithOutline(retryFont, "Press SPACE to Retry", (255, 255, 255), (0, 0, 0), outlineWidth = 3)
+
+    while True:
+        currentTime = pygame.time.get_ticks()
+        timeSinceDeath = currentTime - deathScreenStart
+
+        if timeSinceDeath >= retryTextDelay:
+            fadeElapsed = timeSinceDeath - retryTextDelay
+            fadeT = min(fadeElapsed / retryFadeDuration, 1)
+            fadeT = easeOut(fadeT)
+            retryAlpha = int(lerp(0, 255, fadeT))
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+
+            if event.type == pygame.KEYDOWN and retryAlpha >= 255:
+                if event.key == pygame.K_SPACE:
+                    await startGame(screen, color)
+                    return
+
+        if frames:
+            screen.blit(frames[frameIndex], (0, 0))
+            frameIndex = (frameIndex + 1) % len(frames)
+        else:
+            screen.fill((0, 0, 0))
+            text = font.render("YOU DIED", True, (255, 0, 0))
+            screen.blit(text, text.get_rect(center=screen.get_rect().center))
+
+        if retryAlpha > 0:
+            retryTextSurface.set_alpha(retryAlpha)
+            screen.blit(retryTextSurface, retryTextSurface.get_rect(center=screen.get_rect().center))
+
+        pygame.display.update()
+        clock.tick(12)
+        await asyncio.sleep(0)
+
+def spawnWave(count, playerX, playerY):
+    maxHP = 10
+    speed = baseEnemySpeed
+
+    minCloseDist = min(250 + count * 6, 900)
+    maxCloseDist = min(400 + count * 8, 1200)
+
+    minFarDist = min(900 + count * 14, 2200)
+    maxFarDist = min(1300 + count * 18, 2800)
+
+    newEnemies = []
+
+    for i in range(count):
+        if i % 3 == 0:
+            dist = random.randint(minCloseDist, maxCloseDist)
+        else:
+            dist = random.randint(minFarDist, maxFarDist)
+
+        angle = random.uniform(0, math.pi * 2)
+        x = playerX + math.cos(angle) * dist
+        y = playerY + math.sin(angle) * dist
+
+        newEnemies.append({
+            "x": x,
+            "y": y,
+            "hp": maxHP,
+            "max_hp": maxHP,
+            "speed": speed,
+            "last_hit": -9999
+        })
+
+    return newEnemies
+
+def calculateWaveEnemyCount(waveNum):
+    count = 5
+
+    for _ in range(waveNum - 1):
+        count = math.ceil(count * 1.15)
+
+    return count
+
+def spawnWaveEnemies(waveNum, playerX, playerY, currentTime):
+    totalCount = calculateWaveEnemyCount(waveNum)
+
+    shooterCount = math.ceil(totalCount * 0.20) if waveNum >= 3 else 0
+    chargerCount = max(1, math.ceil(totalCount * 0.05)) if waveNum >= 6 else 0
+
+    defaultCount = max(0, totalCount - shooterCount - chargerCount)
+
+    newDefaults = spawnWave(defaultCount, playerX, playerY)
+    newShooters = enemyModule.spawnShooters(shooterCount, baseEnemySpeed, playerX, playerY) if shooterCount > 0 else []
+    newChargers = chargerModule.spawnChargers(chargerCount, baseEnemySpeed, playerX, playerY, currentTime) if chargerCount > 0 else []
+
+    return newDefaults, newShooters, newChargers
+
+async def startGame(screen, color, loadSave = False):
+    clock = pygame.time.Clock()
+    await loadDeathFrames(screen)
+
+    pygame.mixer.music.load("Things/OST/waves1to10.ogg")
+    pygame.mixer.music.play(-1)
+
+    shootChannel = pygame.mixer.Channel(2)
+    shootChannel.set_volume(0.6)
+
+    intermissionChannel = pygame.mixer.Channel(3)
+    intermissionChannel.set_volume(0.8)
+    intermissionSound = pygame.mixer.Sound("Things/OST/intermission.ogg")
+    mainMusicVolume = 1.0
+
+    punchSwishChannel = pygame.mixer.Channel(4)
+    punchHitChannel = pygame.mixer.Channel(5)
+
+    parriedBulletChannel = pygame.mixer.Channel(6)
+    parriedBulletSound = pygame.mixer.Sound("Things/SFX/parried.wav")
+
+    dashSoundCached = pygame.mixer.Sound("Things/SFX/dashSFX.wav")
+    punchSwishSoundCached = pygame.mixer.Sound("Things/SFX/punchSwish.wav")
+    punchHitSoundCached = pygame.mixer.Sound("Things/SFX/punchHit.wav")
+    shootSoundCached = pygame.mixer.Sound("Things/SFX/Shoot.wav")
+
+    parryClearRadius = 250
+
+    wave = 1
+    initialSpawnDone = False
+    enemies = []
+    enemySize = 75
+    waveClearTimer = 0
+    waitingForNextWave = False
+    nextWaveDelay = 600
+
+    inIntermission = False
+    intermissionStart = 0
+    intermissionDuration = 15000
+    intermissionRemaining = 0
+
+    cardWidth = 260
+    cardHeight = 340
+    cardSpacing = 40
+    cardCount = 3
+
+    cardFadeInDuration = 400
+    cardFadeInStagger = 200
+    cardFadeOutDuration = 500
+
+    cardScaleSpeed = 0.18
+    cardScale = [1.0] * cardCount
+    cardBaseSurfaces = {}
+
+    totalCardsWidth = cardCount * cardWidth + (cardCount - 1) * cardSpacing
+    cardsStartX = screen.get_width() // 2 - totalCardsWidth // 2
+    cardY = screen.get_height() // 2 - cardHeight // 2
+
+    cardRects = [
+        pygame.Rect(cardsStartX + i * (cardWidth + cardSpacing), cardY, cardWidth, cardHeight)
+        for i in range(cardCount)
+    ]
+
+    saveButtonWidth = 320
+    saveButtonHeight = 70
+    saveButtonY = cardY + cardHeight + 70
+    saveButtonRect = pygame.Rect(0, 0, saveButtonWidth, saveButtonHeight)
+    saveButtonRect.center = (screen.get_width() // 2, saveButtonY + saveButtonHeight // 2)
+
+    saveButtonScale = 1.0
+    saveButtonScaleSpeed = 0.18
+    saveButtonFont = pygame.font.Font("Things/Fonts/PressStart2P.ttf", 18)
+    saveButtonSurface = buildSimpleButtonSurface(saveButtonWidth, saveButtonHeight, saveButtonFont, "Save Game")
+
+    saveConfirmAlpha = 0
+    saveConfirmFont = pygame.font.Font("Things/Fonts/PressStart2P.ttf", 16)
+    saveConfirmSurface = saveConfirmFont.render("Saved!", True, (120, 220, 120))
+
+    cardTitleFont = pygame.font.Font("Things/Fonts/PressStart2P.ttf", 15)
+    cardBodyFont = pygame.font.Font("Things/Fonts/PressStart2P.ttf", 12)
+
+    money = 0
+    ownedUpgrades = set()
+    currentIntermissionCards = []
+
+    punchDamage = 10
+    bulletKnockback = False
+    knockbackAmount = 40
+    knockbackFriction = 0.85
+
+    electricFields = []
+    electricFieldDuration = 500
+    electricFieldWidth = 14
+    electricFieldDamage = 5
+    electricFieldSegments = 7
+    electricFieldJaggedness = 18
+    electricFieldReshapeInterval = 60
+
+    parriedBullets = []
+    parriedBulletSpeed = 40
+    parriedBulletSize = 20
+    parrySplashRadius = 150
+    parrySplashDamage = 10
+
+    screenFlashAlpha = 0.0
+    screenFlashMaxAlpha = 100
+    screenFlashDuration = 750
+    screenFlashDecay = screenFlashMaxAlpha / (screenFlashDuration / 1000 * 60)
+    screenFlashSurface = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
+
+    freezeUntil = 0
+    freezeDuration = 500
+    musicPausedForParry = False
+
+    enemySurface = createSquareSurface((220, 40, 40), enemySize)
+    shooterSurface = enemyModule.createShooterSurface(enemyModule.shooterSize)
+
+    shooters = []
+    chargers = []
+    chargerSurface = chargerModule.createChargerSurface(chargerModule.chargerSize)
+
+    squareSize = 75
+    squareSurface = createSquareSurface(color, squareSize)
+    squareRect = squareSurface.get_rect(center = screen.get_rect().center)
+
+    cameraX = 0
+    cameraY = 0
+    cameraSmooth = 0.12
+
+    squareX = float(squareRect.centerx)
+    squareY = float(squareRect.centery)
+
+    dashing = False
+    dashDuration = 180
+    dashSpeed = 35
+    dashStart = 0
+    dashDirX = 0
+    dashDirY = 0
+    dashCooldown = 500
+    lastDashTime = -dashCooldown
+
+    afterimages = []
+
+    health = 100
+    maxHealth = 100
+    playerStatus = {}
+    font = pygame.font.Font("Things/Fonts/PressStart2P.ttf", 28)
+
+    fistSize = 35
+    fistSurface = createSquareSurface(color, fistSize)
+
+    def loadUmbrellaSurface(imagePath):
+        surface = pygame.image.load(imagePath).convert_alpha()
+
+        scale = 135 / max(surface.get_width(), surface.get_height())
+
+        return pygame.transform.smoothscale(
+            surface,
+            (
+                int(surface.get_width() * scale),
+                int(surface.get_height() * scale)
+            )
+        )
+
+
+    umbrellaNormalSurface = loadUmbrellaSurface(
+        "Things/Images/umbrellaNormal.png"
+    )
+
+    umbrellaJoustSurface = loadUmbrellaSurface(
+        "Things/Images/umbrellaJoust.png"
+    )
+
+    umbrellaRotationCache = {}
+    umbrellaEnabled = False
+    umbrellaJoustMode = False
+
+    umbrellaDeflectRadius = 75
+    umbrellaAimX = 0
+    umbrellaAimY = -1
+
+    fistSpawned = False
+    fistX = squareX
+    fistY = squareY
+    fistLeash = 150
+
+    punching = False
+    punchStart = 0
+    punchHitPlayed = False
+    punchParried = False
+
+    punchStartDistance = fistLeash
+    punchOutDuration = 90
+    punchBackDuration = 140
+    punchExtraDistance = 120
+
+    returning = False
+    returnStart = 0
+    returnDuration = 150
+    returnStartX = fistX
+    returnStartY = fistY
+
+    punchDirX = 0
+    punchDirY = 0
+    punchCooldown = 1000
+
+    lastPunchTime = -punchCooldown
+
+    projectiles = []
+    projectileSize = 12
+    projectileSpeed = 14
+    projectileCooldown = 100
+    lastShotTime = -projectileCooldown
+    shooterProjectiles = []
+
+    def applyUpgradeEffects(upgradeId):
+        nonlocal dashCooldown, dashSpeed, punchDamage, projectileCooldown, bulletKnockback, umbrellaEnabled, umbrellaJoustMode
+
+        if upgradeId == "betterDashes":
+            dashCooldown = 250
+            dashSpeed = 50
+        elif upgradeId == "betterFists":
+            punchDamage = 20
+        elif upgradeId == "betterBullets":
+            projectileCooldown = 75
+            bulletKnockback = True
+        elif upgradeId == "umbrella":
+            umbrellaEnabled = True
+            umbrellaJoustMode = False
+
+    if loadSave:
+        savedData = loadGameData()
+        if savedData:
+            wave = savedData.get("wave", 1)
+            money = savedData.get("money", 0)
+            ownedUpgrades = set(savedData.get("upgrades", []))
+
+            for upgradeId in ownedUpgrades:
+                applyUpgradeEffects(upgradeId)
+
+    if wave >= 11:
+        pygame.mixer.music.stop()
+
+    pausedTotal = 0
+    iceman = None
+    icemanSpawned = False
+    icemanDialoguePending = False
+    icemanChoice = None
+
+    icemanAppearTime = 0
+    icemanDialogueTime = 0
+    icemanFadeDuration = 600
+    icemanDialogueDelay = 0
+
+    icemanActive = False
+    icemanBar = None
+    icemanDefeated = False
+    icemanLastPunchStart = -1
+
+    icemanSurface = icemanModule.createIcemanSurface()
+
+    async def pausedDialogue(dialogueCall):
+        nonlocal pausedTotal
+
+        pauseStart = pygame.time.get_ticks()
+        pygame.mixer.pause()
+        pygame.mixer.music.pause()
+
+        try:
+            return await dialogueCall
+        finally:
+            pygame.mixer.unpause()
+            pygame.mixer.music.unpause()
+            pausedTotal += pygame.time.get_ticks() - pauseStart
+
+    fadeInDuration = 500
+    fadeStart = pygame.time.get_ticks()
+    alpha = 0
+
+    while True:
+        currentTime = pygame.time.get_ticks() - pausedTotal
+        elapsed = currentTime - fadeStart
+
+        fadeT = min(elapsed / fadeInDuration, 1)
+        fadeT = easeOut(fadeT)
+        alpha = int(lerp(0, 255, fadeT))
+        playerFrozen = statuses.isFrozen(playerStatus, currentTime)
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_e and not playerFrozen:
+                    if fistSpawned:
+                        fistSpawned = False
+                        punching = False
+                    else:
+                        fistSpawned = True
+                        fistX = squareX
+                        fistY = squareY
+
+                if event.key == pygame.K_r and umbrellaEnabled and fistSpawned and not playerFrozen:
+                    umbrellaJoustMode = not umbrellaJoustMode
+
+                if event.key == pygame.K_q and not dashing and not playerFrozen and currentTime - lastDashTime >= dashCooldown:
+                    dx = 0
+                    dy = 0
+
+                    if keys[pygame.K_a]: dx -= 1
+                    if keys[pygame.K_d]: dx += 1
+                    if keys[pygame.K_w]: dy -= 1
+                    if keys[pygame.K_s]: dy += 1
+
+                    if dx != 0 or dy != 0:
+                        length = math.sqrt(dx * dx + dy * dy)
+                        dashDirX = dx / length
+                        dashDirY = dy / length
+                        dashing = True
+                        dashStart = currentTime
+                        lastDashTime = currentTime
+
+                        if "electricDashes" in ownedUpgrades:
+                            dashFrames = dashDuration / 1000 * 60
+                            dashDistance = dashSpeed * dashFrames
+
+                            startX, startY = squareX, squareY
+                            squareX += dashDirX * dashDistance
+                            squareY += dashDirY * dashDistance
+
+                            electricFields.append({
+                                "x1": startX,
+                                "y1": startY,
+                                "x2": squareX,
+                                "y2": squareY,
+                                "startTime": currentTime,
+                                "hitTargets": set()
+                            })
+
+                        dashSoundCached.play()
+
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                if inIntermission:
+                    mouseX, mouseY = pygame.mouse.get_pos()
+
+                    for i in range(cardCount):
+                        if i < len(currentIntermissionCards) and cardRects[i].collidepoint((mouseX, mouseY)):
+                            upgradeId = currentIntermissionCards[i]
+
+                            if upgradeId not in ownedUpgrades and money >= upgradeDefinitions[upgradeId]["cost"]:
+                                money -= upgradeDefinitions[upgradeId]["cost"]
+                                ownedUpgrades.add(upgradeId)
+                                applyUpgradeEffects(upgradeId)
+
+                            break
+
+                    if saveButtonRect.collidepoint((mouseX, mouseY)):
+                        saveGameData(wave, money, ownedUpgrades)
+                        saveConfirmAlpha = 255
+
+                activePunchCooldown = punchCooldown / 2 if umbrellaEnabled and umbrellaJoustMode else punchCooldown
+                if fistSpawned and not punching and not playerFrozen and currentTime - lastPunchTime >= activePunchCooldown:
+                    mouseX, mouseY = pygame.mouse.get_pos()
+                    mouseWorldX = mouseX + cameraX
+                    mouseWorldY = mouseY + cameraY
+
+                    dirX = mouseWorldX - squareX
+                    dirY = mouseWorldY - squareY
+                    dirLength = math.sqrt(dirX * dirX + dirY * dirY)
+
+                    if dirLength == 0:
+                        dirX, dirY = 0, -1
+                    else:
+                        dirX /= dirLength
+                        dirY /= dirLength
+
+                    punchDirX = dirX
+                    punchDirY = dirY
+
+                    currentOffsetX = fistX - squareX
+                    currentOffsetY = fistY - squareY
+                    punchStartDistance = math.sqrt(currentOffsetX * currentOffsetX + currentOffsetY * currentOffsetY)
+
+                    punching = True
+                    punchStart = currentTime
+                    lastPunchTime = currentTime
+                    punchHitPlayed = False
+                    punchParried = False
+
+                    punchSwishChannel.play(punchSwishSoundCached)
+
+                elif not fistSpawned and not playerFrozen and currentTime - lastShotTime >= projectileCooldown:
+                    mouseX, mouseY = pygame.mouse.get_pos()
+                    
+                    mouseWorldX = mouseX + cameraX
+                    mouseWorldY= mouseY + cameraY
+
+                    dirX = mouseWorldX - squareX
+                    dirY = mouseWorldY - squareY
+                    length = math.sqrt(dirX * dirX + dirY * dirY)
+
+                    if length == 0:
+                        dirX, dirY = 0, -1
+                    else:
+                        dirX /= length
+                        dirY /= length
+
+                    projectiles.append({
+                        "x": squareX,
+                        "y": squareY,
+                        "dx": dirX * projectileSpeed,
+                        "dy": dirY * projectileSpeed
+                    })
+                    lastShotTime = currentTime
+
+                    shootChannel.play(shootSoundCached)
+
+        keys = pygame.key.get_pressed()
+        frozen = currentTime < freezeUntil
+
+        if musicPausedForParry and currentTime >= freezeUntil:
+            pygame.mixer.music.set_volume(mainMusicVolume)
+            musicPausedForParry = False
+
+        if not frozen and not playerFrozen:
+            if dashing:
+                if "electricDashes" not in ownedUpgrades:
+                    squareX += dashDirX * dashSpeed
+                    squareY += dashDirY * dashSpeed
+
+                    afterimages.append({
+                        "x": squareX,
+                        "y": squareY,
+                        "alpha": 160
+                    })
+
+                if currentTime - dashStart >= dashDuration:
+                    dashing = False
+            else:
+                dx = 0
+                dy = 0
+
+                if keys[pygame.K_a]: dx -= 1
+                if keys[pygame.K_d]: dx += 1
+                if keys[pygame.K_w]: dy -= 1
+                if keys[pygame.K_s]: dy += 1
+
+                if dx != 0 and dy != 0:
+                    length = math.sqrt(dx * dx + dy * dy)
+                    dx /= length
+                    dy /= length
+
+                squareX += dx * moveSpeed
+                squareY += dy * moveSpeed
+
+        squareRect.center = (squareX, squareY)
+
+        targetCamX = squareX - screen.get_width() // 2
+        targetCamY = squareY - screen.get_height() // 2
+
+        cameraX += (targetCamX - cameraX) * cameraSmooth
+        cameraY += (targetCamY - cameraY) * cameraSmooth
+
+        if not frozen:
+            for e in enemies:
+                knockbackX = e.get("knockbackX", 0)
+                knockbackY = e.get("knockbackY", 0)
+
+                if abs(knockbackX) > 0.5 or abs(knockbackY) > 0.5:
+                    e["x"] += knockbackX
+                    e["y"] += knockbackY
+                    e["knockbackX"] = knockbackX * knockbackFriction
+                    e["knockbackY"] = knockbackY * knockbackFriction
+                else:
+                    e["knockbackX"] = 0
+                    e["knockbackY"] = 0
+
+                    dx = squareX - e["x"]
+                    dy = squareY - e["y"]
+
+                    dist = math.sqrt(dx*dx + dy*dy)
+                    if dist > 0:
+                        effectiveSpeed = statuses.getEffectiveSpeed(e, currentTime)
+                        e["x"] += (dx / dist) * effectiveSpeed
+                        e["y"] += (dy / dist) * effectiveSpeed
+
+        if not frozen:
+            for s in shooters:
+                enemyModule.updateShooterMovement(s, squareX, squareY, enemies, shooters)
+                newPellet = enemyModule.tryShooterShoot(s, currentTime, squareX, squareY)
+                
+                if newPellet:
+                    newPellet["sourceShooter"] = s
+                    shooterProjectiles.append(newPellet)
+
+                knockbackX = s.get("knockbackX", 0)
+                knockbackY = s.get("knockbackY", 0)
+
+                if abs(knockbackX) > 0.5 or abs(knockbackY) > 0.5:
+                    s["x"] += knockbackX
+                    s["y"] += knockbackY
+                    s["knockbackX"] = knockbackX * knockbackFriction
+                    s["knockbackY"] = knockbackY * knockbackFriction
+                else:
+                    s["knockbackX"] = 0
+                    s["knockbackY"] = 0
+            for c in chargers:
+                chargerModule.updateChargerMovement(c, squareX, squareY, currentTime)
+
+        for e in enemies:
+            if abs(e["x"] - squareX) < (enemySize + squareSize) / 2 and \
+            abs(e["y"] - squareY) < (enemySize + squareSize) / 2:
+
+                dashInvincible = dashing and "betterDashes" in ownedUpgrades
+
+                if not dashInvincible and currentTime - e["last_hit"] >= 2000:
+                    health -= 20
+                    e["last_hit"] = currentTime
+
+                    if health <= 0:
+                        health = 0
+                        pygame.mixer.music.stop()
+                        deathStart = pygame.time.get_ticks()
+
+                        while pygame.time.get_ticks() - deathStart < 250:
+                            for event in pygame.event.get():
+                                if event.type == pygame.QUIT:
+                                    pygame.quit()
+                                    sys.exit()
+
+                            pygame.display.update()
+                            await asyncio.sleep(0)
+                        await die(screen, color)
+                        return
+
+        if icemanActive and iceman is not None:
+            dashInvincible = dashing and "betterDashes" in ownedUpgrades
+            icemanDamage = 0
+
+            if not frozen:
+                behaviourDamage, icemanFroze = icemanModule.updateIcemanBehaviour(
+                    iceman, currentTime, projectiles, punching,
+                    squareX, squareY, squareSize, punchDirX, punchDirY, dashInvincible, playerFrozen
+                )
+                icemanDamage += behaviourDamage
+
+                if icemanFroze:
+                    statuses.freeze(playerStatus, currentTime, icemanModule.icemanFrozenDuration)
+
+            if not dashInvincible:
+                icemanDamage += icemanModule.tryTouchDamage(iceman, squareX, squareY, squareSize, currentTime)
+
+            if icemanDamage > 0:
+                health -= icemanDamage
+
+                if health <= 0:
+                    health = 0
+                    pygame.mixer.music.stop()
+                    deathStart = pygame.time.get_ticks()
+
+                    while pygame.time.get_ticks() - deathStart < 250:
+                        for event in pygame.event.get():
+                            if event.type == pygame.QUIT:
+                                pygame.quit()
+                                sys.exit()
+
+                        pygame.display.update()
+                        await asyncio.sleep(0)
+                    await die(screen, color)
+                    return
+
+        if umbrellaEnabled and fistSpawned and not umbrellaJoustMode:
+            for c in chargers:
+                if c["chargeState"] != "charging":
+                    continue
+
+                chargerOffsetX = c["x"] - fistX
+                chargerOffsetY = c["y"] - fistY
+
+                chargerDistance = math.sqrt(
+                    chargerOffsetX * chargerOffsetX +
+                    chargerOffsetY * chargerOffsetY
+                )
+
+                if chargerDistance == 0:
+                    continue
+
+                chargerDirectionX = chargerOffsetX / chargerDistance
+                chargerDirectionY = chargerOffsetY / chargerDistance
+
+                canopyDotProduct = (
+                    chargerDirectionX * umbrellaAimX +
+                    chargerDirectionY * umbrellaAimY
+                )
+
+                chargerCollisionDistance = (
+                    umbrellaDeflectRadius +
+                    chargerModule.chargerSize / 2
+                )
+
+                if canopyDotProduct >= 0.35 and chargerDistance <= chargerCollisionDistance:
+                    chargerModule.interruptChargeWithPunch(
+                        c,
+                        umbrellaAimX,
+                        umbrellaAimY
+                    )
+
+                    c["last_hit"] = currentTime
+                    punchHitChannel.play(punchHitSoundCached)
+
+
+        for c in chargers:
+            chargerHalfSize = (chargerModule.chargerSize + squareSize) / 2
+
+            if abs(c["x"] - squareX) < chargerHalfSize and abs(c["y"] - squareY) < chargerHalfSize:
+                dashInvincible = dashing and "betterDashes" in ownedUpgrades
+
+                if not dashInvincible:
+                    if c["chargeState"] == "charging":
+                        if currentTime - c["last_hit"] >= 500:
+                            health -= chargerModule.chargerChargeTouchDamage
+                            c["last_hit"] = currentTime
+                            c["chargeState"] = "idle"
+
+                            if health <= 0:
+                                health = 0
+                                pygame.mixer.music.stop()
+                                deathStart = pygame.time.get_ticks()
+
+                                while pygame.time.get_ticks() - deathStart < 250:
+                                    for event in pygame.event.get():
+                                        if event.type == pygame.QUIT:
+                                            pygame.quit()
+                                            sys.exit()
+
+                                    pygame.display.update()
+                                    await asyncio.sleep(0)
+
+                                await die(screen, color)
+                                return
+
+                    else:
+                        if currentTime - c["last_hit"] >= 2000:
+                            health -= chargerModule.chargerTouchDamage
+                            c["last_hit"] = currentTime
+
+                            if health <= 0:
+                                health = 0
+                                pygame.mixer.music.stop()
+                                deathStart = pygame.time.get_ticks()
+
+                                while pygame.time.get_ticks() - deathStart < 250:
+                                    for event in pygame.event.get():
+                                        if event.type == pygame.QUIT:
+                                            pygame.quit()
+                                            sys.exit()
+
+                                    pygame.display.update()
+                                    await asyncio.sleep(0)
+
+                                await die(screen, color)
+                                return
+
+        activePunchDamage = punchDamage
+        if umbrellaEnabled and umbrellaJoustMode:
+            activePunchDamage += 10
+
+        if punching:
+            for e in (enemies + shooters)[:]:
+                if abs(fistX - e["x"]) < (fistSize + enemySize) / 2 and \
+                abs(fistY - e["y"]) < (fistSize + enemySize) / 2:
+                    e["hp"] -= activePunchDamage
+
+                    if not punchHitPlayed:
+                        punchHitChannel.play(punchHitSoundCached)
+                        punchHitPlayed = True
+
+                    if e["hp"] <= 0:
+                        if e in enemies:
+                            enemies.remove(e)
+                        if e in shooters:
+                            shooters.remove(e)
+
+            for c in chargers[:]:
+                chargerHalfSize = (fistSize + chargerModule.chargerSize) / 2
+                if abs(fistX - c["x"]) < chargerHalfSize and abs(fistY - c["y"]) < chargerHalfSize:
+
+                    if c["chargeState"] == "charging":
+                        chargerModule.interruptChargeWithPunch(c, punchDirX, punchDirY)
+
+                        if not punchHitPlayed:
+                            punchHitChannel.play(punchHitSoundCached)
+                            punchHitPlayed = True
+                    else:
+                        c["hp"] -= punchDamage
+
+                        if not punchHitPlayed:
+                            punchHitChannel.play(punchHitSoundCached)
+                            punchHitPlayed = True
+
+                        if c["hp"] <= 0:
+                            chargers.remove(c)
+
+            if icemanActive and iceman is not None and icemanLastPunchStart != punchStart:
+                if icemanModule.overlaps(iceman, fistX, fistY, fistSize):
+                    icemanModule.damage(iceman, activePunchDamage)
+                    icemanLastPunchStart = punchStart
+                    punchHitChannel.play(punchHitSoundCached)
+                    punchHitPlayed = True
+
+            punchElapsed = currentTime - punchStart
+
+            if ("betterFists" in ownedUpgrades and not punchParried and not (umbrellaEnabled and umbrellaJoustMode)):
+                for sp in shooterProjectiles[:]:
+                    if abs(fistX - sp["x"]) < (fistSize + enemyModule.shooterProjectileSize) / 2 and \
+                    abs(fistY - sp["y"]) < (fistSize + enemyModule.shooterProjectileSize) / 2:
+                        parryX, parryY = sp["x"], sp["y"]
+                        shooterProjectiles.remove(sp)
+
+                        for nearbySp in shooterProjectiles[:]:
+                            nearbyDistSquared = (nearbySp["x"] - parryX) ** 2 + (nearbySp["y"] - parryY) ** 2
+                            if nearbyDistSquared <= parryClearRadius ** 2:
+                                shooterProjectiles.remove(nearbySp)
+
+                        parriedBullets.append({
+                            "x": parryX,
+                            "y": parryY,
+                            "target": sp.get("sourceShooter")
+                        })
+
+                        screenFlashAlpha = screenFlashMaxAlpha
+                        freezeUntil = currentTime + freezeDuration
+
+                        pygame.mixer.music.set_volume(0.0)
+                        musicPausedForParry = True
+
+                        parriedBulletChannel.play(parriedBulletSound)
+
+                        punchParried = True
+                        break
+
+            if punchElapsed <= punchOutDuration:
+                punchT = punchElapsed / punchOutDuration
+                punchDistance = lerp(punchStartDistance, punchStartDistance + punchExtraDistance, punchT)
+            elif punchElapsed <= punchOutDuration + punchBackDuration:
+                punchT = (punchElapsed - punchOutDuration) / punchBackDuration
+                punchT = easeOut(punchT)
+                punchDistance = lerp(punchStartDistance + punchExtraDistance, fistLeash, punchT)
+            else:
+                punching = False
+                returning = True
+                returnStart = currentTime
+                returnStartX = fistX
+                returnStartY = fistY
+                punchDistance = fistLeash
+
+            fistX = squareX + punchDirX * punchDistance
+            fistY = squareY + punchDirY * punchDistance
+
+            umbrellaAimX = punchDirX
+            umbrellaAimY = punchDirY
+
+        elif returning:
+            mouseX, mouseY = pygame.mouse.get_pos()
+            mouseWorldX = mouseX + cameraX
+            mouseWorldY = mouseY + cameraY
+
+            offsetX = mouseWorldX - squareX
+            offsetY = mouseWorldY - squareY
+            distance = math.sqrt(offsetX * offsetX + offsetY * offsetY)
+
+            if distance > fistLeash:
+                scale = fistLeash / distance
+                offsetX *= scale
+                offsetY *= scale
+
+            targetX = squareX + offsetX
+            targetY = squareY + offsetY
+
+            returnElapsed = currentTime - returnStart
+            returnT = min(returnElapsed / returnDuration, 1)
+            returnT = easeOut(returnT)
+
+            fistX = lerp(returnStartX, targetX, returnT)
+            fistY = lerp(returnStartY, targetY, returnT)
+
+            if returnT >= 1:
+                returning = False
+
+        elif fistSpawned:
+            mouseX, mouseY = pygame.mouse.get_pos()
+            mouseWorldX = mouseX + cameraX
+            mouseWorldY = mouseY + cameraY
+
+            offsetX = mouseWorldX - squareX
+            offsetY = mouseWorldY - squareY
+            distance = math.sqrt(offsetX * offsetX + offsetY * offsetY)
+
+            if distance > 0:
+                umbrellaAimX = offsetX / distance
+                umbrellaAimY = offsetY / distance
+
+            if distance > fistLeash:
+                scale = fistLeash / distance
+                offsetX *= scale
+                offsetY *= scale
+
+            fistX = squareX + offsetX
+            fistY = squareY + offsetY
+
+        if not frozen:
+            for p in projectiles[:]:
+                p["x"] += p["dx"]
+                p["y"] += p["dy"]
+
+                distSquared = (p["x"] - squareX) ** 2 + (p["y"] - squareY) ** 2
+                if distSquared > 2000 ** 2:
+                    projectiles.remove(p)
+                    continue
+
+                for e in (enemies + shooters)[:]:
+                    if abs(p["x"] - e["x"]) < (projectileSize + enemySize) / 2 and \
+                    abs(p["y"] - e["y"]) < (projectileSize + enemySize) / 2:
+                        
+                        e["hp"] -= 5
+
+                        if bulletKnockback:
+                            knockbackLength = math.sqrt(p["dx"] ** 2 + p["dy"] ** 2)
+                            if knockbackLength > 0:
+                                e["knockbackX"] = e.get("knockbackX", 0) + (p["dx"] / knockbackLength) * knockbackAmount
+                                e["knockbackY"] = e.get("knockbackY", 0) + (p["dy"] / knockbackLength) * knockbackAmount
+
+                        if p in projectiles:
+                            projectiles.remove(p)
+                        if e["hp"] <= 0:
+                            if e in enemies:
+                                enemies.remove(e)
+                            if e in shooters:
+                                shooters.remove(e)
+                        break
+
+                if p in projectiles and icemanActive and iceman is not None:
+                    if icemanModule.overlaps(iceman, p["x"], p["y"], projectileSize):
+                        icemanModule.damage(iceman, 5)
+                        projectiles.remove(p)
+                        continue
+
+                if p in projectiles:
+                    for c in chargers[:]:
+                        chargerHalfSize = (projectileSize + chargerModule.chargerSize) / 2
+                        if abs(p["x"] - c["x"]) < chargerHalfSize and abs(p["y"] - c["y"]) < chargerHalfSize:
+
+                            if c["chargeState"] != "charging":
+                                c["hp"] -= 5
+
+                                if bulletKnockback:
+                                    knockbackLength = math.sqrt(p["dx"] ** 2 + p["dy"] ** 2)
+                                    if knockbackLength > 0:
+                                        c["knockbackX"] = c.get("knockbackX", 0) + (p["dx"] / knockbackLength) * knockbackAmount
+                                        c["knockbackY"] = c.get("knockbackY", 0) + (p["dy"] / knockbackLength) * knockbackAmount
+
+                                if c["hp"] <= 0:
+                                    chargers.remove(c)
+
+                            projectiles.remove(p)
+                            break
+
+            for sp in shooterProjectiles[:]:
+                sp["x"] += sp["dx"]
+                sp["y"] += sp["dy"]
+
+                if umbrellaEnabled and fistSpawned and not umbrellaJoustMode and "betterFists" in ownedUpgrades:
+                    bulletOffsetX = sp["x"] - fistX
+                    bulletOffsetY = sp["y"] - fistY
+                    bulletDistance = math.sqrt(bulletOffsetX * bulletOffsetX + bulletOffsetY * bulletOffsetY)
+
+                    if bulletDistance > 0:
+                        bulletDirectionX = bulletOffsetX / bulletDistance
+                        bulletDirectionY = bulletOffsetY / bulletDistance
+
+                        canopyDotProduct = (bulletDirectionX * umbrellaAimX + bulletDirectionY * umbrellaAimY)
+
+                        bulletCollisionDistance = (umbrellaDeflectRadius + enemyModule.shooterProjectileSize / 2)
+
+                        if canopyDotProduct >= 0.35 and bulletDistance <= bulletCollisionDistance:
+                            shooterProjectiles.remove(sp)
+
+                            parriedBullets.append({
+                                "x": sp["x"],
+                                "y": sp["y"],
+                                "target": sp.get("sourceShooter")
+                            })
+
+                            screenFlashAlpha = screenFlashMaxAlpha
+                            freezeUntil = currentTime + freezeDuration
+
+                            pygame.mixer.music.set_volume(0.0)
+                            musicPausedForParry = True
+
+                            parriedBulletChannel.play(parriedBulletSound)
+                            continue
+
+                distSquared = (sp["x"] - squareX) ** 2 + (sp["y"] - squareY) ** 2
+                if distSquared > 2000 ** 2:
+                    shooterProjectiles.remove(sp)
+                    continue
+
+                if abs(sp["x"] - squareX) < (enemyModule.shooterProjectileSize + squareSize) / 2 and \
+                abs(sp["y"] - squareY) < (enemyModule.shooterProjectileSize + squareSize) / 2:
+                    
+                    dashInvincible = dashing and "betterDashes" in ownedUpgrades
+                    shooterProjectiles.remove(sp)
+
+                    if not dashInvincible:
+                        health -= 10
+
+                    if health <= 0:
+                        health = 0
+                        pygame.mixer.music.stop()
+                        deathStart = pygame.time.get_ticks()
+
+                        while pygame.time.get_ticks() - deathStart < 250:
+                            for event in pygame.event.get():
+                                if event.type == pygame.QUIT:
+                                    pygame.quit()
+                                    sys.exit()
+
+                            pygame.display.update()
+                            await asyncio.sleep(0)
+                        await die(screen, color)
+                        return
+
+            aliveShooterIds = {id(shooter) for shooter in shooters}
+            for pb in parriedBullets[:]:
+                target = pb.get("target")
+                targetAlive = target is not None and id(target) in aliveShooterIds
+
+                if not targetAlive:
+                    parriedBullets.remove(pb)
+                    continue
+
+                dirX = target["x"] - pb["x"]
+                dirY = target["y"] - pb["y"]
+                dist = math.sqrt(dirX * dirX + dirY * dirY)
+
+                if dist <= parriedBulletSpeed:
+                    targetIndex = None
+
+                    for i, shooter in enumerate(shooters):
+                        if shooter is target:
+                            targetIndex = i
+                            break
+
+                    if targetIndex is None:
+                        parriedBullets.remove(pb)
+                        continue
+
+                    splashX = target["x"]
+                    splashY = target["y"]
+
+                    shooters.pop(targetIndex)
+                    aliveShooterIds.discard(id(target))
+
+                    for other in (enemies + shooters)[:]:
+                        otherDistSquared = (
+                            (other["x"] - splashX) ** 2 +
+                            (other["y"] - splashY) ** 2
+                        )
+
+                        if otherDistSquared <= parrySplashRadius ** 2:
+                            other["hp"] -= parrySplashDamage
+
+                            if other["hp"] <= 0:
+                                if other in enemies:
+                                    enemies.remove(other)
+
+                                if other in shooters:
+                                    shooters.remove(other)
+                                    aliveShooterIds.discard(id(other))
+
+                    parriedBullets.remove(pb)
+                    continue
+
+                pb["x"] += (dirX / dist) * parriedBulletSpeed
+                pb["y"] += (dirY / dist) * parriedBulletSpeed
+
+                for e in (enemies + shooters)[:]:
+                    if e is target:
+                        continue
+
+                    if abs(pb["x"] - e["x"]) < (parriedBulletSize + enemySize) / 2 and \
+                    abs(pb["y"] - e["y"]) < (parriedBulletSize + enemySize) / 2:
+                        if e in enemies:
+                            enemies.remove(e)
+                        if e in shooters:
+                            shooters.remove(e)
+
+            for field in electricFields[:]:
+                if currentTime - field["startTime"] > electricFieldDuration:
+                    electricFields.remove(field)
+                    continue
+
+                for e in (enemies + shooters)[:]:
+                    eId = id(e)
+                    if eId in field["hitTargets"]:
+                        continue
+
+                    distSquared = pointToSegmentDistanceSquared(e["x"], e["y"], field["x1"], field["y1"], field["x2"], field["y2"])
+                    if distSquared <= (electricFieldWidth / 2 + enemySize / 2) ** 2:
+                        e["hp"] -= electricFieldDamage
+                        field["hitTargets"].add(eId)
+                        statuses.slowness(e, currentTime)
+
+                        if e["hp"] <= 0:
+                            if e in enemies:
+                                enemies.remove(e)
+                            if e in shooters:
+                                shooters.remove(e)
+
+                if icemanActive and iceman is not None and id(iceman) not in field["hitTargets"]:
+                    if icemanModule.touchesSegment(iceman, field["x1"], field["y1"], field["x2"], field["y2"], electricFieldWidth):
+                        icemanModule.damage(iceman, electricFieldDamage)
+                        field["hitTargets"].add(id(iceman))
+
+                for c in chargers[:]:
+                    chargerHalfSize = (fistSize + chargerModule.chargerSize) / 2
+                    if abs(fistX - c["x"]) < chargerHalfSize and abs(fistY - c["y"]) < chargerHalfSize:
+                        if c["chargeState"] == "charging":
+                            if umbrellaEnabled and umbrellaJoustMode:
+                                c["hp"] -= activePunchDamage
+
+                                if not punchHitPlayed:
+                                    punchHitChannel.play(punchHitSoundCached)
+                                    punchHitPlayed = True
+
+                                if c["hp"] <= 0:
+                                    chargers.remove(c)
+
+                            else:
+                                chargerModule.interruptChargeWithPunch(c, punchDirX, punchDirY)
+                                if not punchHitPlayed:
+                                    punchHitChannel.play(punchHitSoundCached)
+                                    punchHitPlayed = True
+
+                        else:
+                            c["hp"] -= activePunchDamage
+                            if not punchHitPlayed:
+                                punchHitChannel.play(punchHitSoundCached)
+                                punchHitPlayed = True
+
+                            if c["hp"] <= 0:
+                                chargers.remove(c)
+
+        if icemanActive and iceman is not None and iceman["hp"] <= 0:
+            pygame.mixer.music.stop()
+            iceman = None
+            icemanActive = False
+            icemanBar = None
+            icemanDefeated = True
+
+        if not initialSpawnDone and not enemies and not shooters and not chargers and not waitingForNextWave and currentTime - fadeStart > 800 and currentTime - fadeStart < 2000:
+            enemies, shooters, chargers = spawnWaveEnemies(wave, squareX, squareY, currentTime)
+            initialSpawnDone = True
+
+        if not enemies and not shooters and not chargers and not waitingForNextWave and not inIntermission and (not icemanSpawned or icemanDefeated) and wave >= 1 and currentTime - fadeStart > 2000:
+            if wave == 10 and not icemanSpawned:
+                iceman = icemanModule.spawnIceman(squareX, squareY, moveSpeed)
+
+                icemanSpawned = True
+                health = maxHealth
+                icemanDialoguePending = True
+                icemanAppearTime = currentTime
+                icemanDialogueTime = currentTime + icemanDialogueDelay
+
+            elif wave % 5 == 0:
+                health = maxHealth
+                inIntermission = True
+                intermissionStart = currentTime
+                money += 100 if wave % 10 == 0 else (50 if wave % 5 == 0 else 0)
+
+                projectiles.clear()
+                shooterProjectiles.clear()
+                parriedBullets.clear()
+                electricFields.clear()
+                afterimages.clear()
+
+                dashing = False
+                punching = False
+                returning = False
+
+                screenFlashAlpha = 0
+                freezeUntil = 0
+                musicPausedForParry = False
+                currentIntermissionCards = random.sample(list(upgradeDefinitions.keys()), k = min(cardCount, len(upgradeDefinitions)))
+
+                pygame.mixer.music.set_volume(0.0)
+                intermissionChannel.play(intermissionSound)
+            else:
+                waitingForNextWave = True
+                waveClearTimer = currentTime
+
+        if waitingForNextWave and currentTime - waveClearTimer >= nextWaveDelay:
+            wave += 1
+            enemies, shooters, chargers = spawnWaveEnemies(wave, squareX, squareY, currentTime)
+            waitingForNextWave = False
+
+            if wave == 11:
+                pygame.mixer.music.stop()
+
+        if inIntermission:
+            intermissionRemaining = max(0, intermissionDuration - (currentTime - intermissionStart))
+
+            if intermissionRemaining <= 0:
+                inIntermission = False
+                intermissionChannel.stop()
+                pygame.mixer.music.set_volume(mainMusicVolume)
+
+                wave += 1
+                enemies, shooters, chargers = spawnWaveEnemies(wave, squareX, squareY, currentTime)
+
+                if wave == 11:
+                    pygame.mixer.music.stop()
+
+        screen.fill((20, 20, 20))
+        for img in afterimages[:]:
+            img["alpha"] -= 12
+            if img["alpha"] <= 0:
+                afterimages.remove(img)
+
+        for img in afterimages:
+            squareSurface.set_alpha(img["alpha"])
+            rect = squareSurface.get_rect(center=(img["x"] - cameraX, img["y"] - cameraY))
+            screen.blit(squareSurface, rect)
+
+        squareSurface.set_alpha(alpha)
+        screen.blit(squareSurface, (squareRect.x - cameraX, squareRect.y - cameraY))
+        statuses.drawFrozen(screen, playerStatus, squareX - cameraX, squareY - cameraY, squareSize, currentTime)
+
+        for p in projectiles:
+            pygame.draw.rect(screen, (255, 255, 255), 
+                            (p["x"] - cameraX - projectileSize // 2, 
+                            p["y"] - cameraY - projectileSize // 2, 
+                            projectileSize, projectileSize))
+
+        for sp in shooterProjectiles:
+            pygame.draw.rect(screen, (255, 140, 0), 
+                            (sp["x"] - cameraX - enemyModule.shooterProjectileSize // 2, 
+                            sp["y"] - cameraY - enemyModule.shooterProjectileSize // 2, 
+                            enemyModule.shooterProjectileSize, enemyModule.shooterProjectileSize))
+
+        for pb in parriedBullets:
+            pygame.draw.rect(screen, (255, 255, 255), 
+                            (pb["x"] - cameraX - parriedBulletSize // 2, 
+                            pb["y"] - cameraY - parriedBulletSize // 2, 
+                            parriedBulletSize, parriedBulletSize))
+
+        for field in electricFields:
+            fieldElapsed = currentTime - field["startTime"]
+            fieldT = min(fieldElapsed / electricFieldDuration, 1)
+            fadeFactor = 1 - fieldT
+
+            reshapeSeed = id(field) + (currentTime // electricFieldReshapeInterval)
+            boltPoints = generateLightningPoints(
+                field["x1"], field["y1"], field["x2"], field["y2"],
+                electricFieldSegments, electricFieldJaggedness, reshapeSeed
+            )
+
+            screenPoints = [(px - cameraX, py - cameraY) for px, py in boltPoints]
+
+            boltColor = (int(100 * fadeFactor), int(220 * fadeFactor), int(255 * fadeFactor))
+            pygame.draw.lines(screen, boltColor, False, screenPoints, electricFieldWidth)
+
+        if fistSpawned:
+            if umbrellaEnabled:
+                umbrellaAngle = -math.degrees(math.atan2(umbrellaAimY, umbrellaAimX)) - 90
+
+                if umbrellaJoustMode:
+                    umbrellaAngle += 180
+
+                cachedAngle = int(round(umbrellaAngle / 5) * 5) % 360
+                cacheKey = (umbrellaJoustMode, cachedAngle)
+
+                if cacheKey not in umbrellaRotationCache:
+                    umbrellaSurface = (
+                        umbrellaJoustSurface
+                        if umbrellaJoustMode
+                        else umbrellaNormalSurface
+                    )
+
+                    umbrellaRotationCache[cacheKey] = pygame.transform.rotate(umbrellaSurface, cachedAngle)
+
+                rotatedUmbrella = umbrellaRotationCache[cacheKey]
+                rotatedUmbrella.set_alpha(alpha)
+
+                umbrellaRect = rotatedUmbrella.get_rect(center = (fistX - cameraX, fistY - cameraY))
+                screen.blit(rotatedUmbrella, umbrellaRect)
+            else:
+                fistSurface.set_alpha(alpha)
+
+                fistRect = fistSurface.get_rect(
+                    center=(fistX - cameraX, fistY - cameraY)
+                )
+
+                screen.blit(fistSurface, fistRect)
+
+        for e in enemies:
+            rect = enemySurface.get_rect(center = (e["x"] - cameraX, e["y"] - cameraY))
+            screen.blit(enemySurface, rect)
+
+        for s in shooters:
+            rect = shooterSurface.get_rect(center = (s["x"] - cameraX, s["y"] - cameraY))
+            screen.blit(shooterSurface, rect)
+
+        if iceman is not None:
+            icemanModule.drawFreezeIndicator(screen, iceman, cameraX, cameraY, squareSize, currentTime)
+
+            rect = icemanSurface.get_rect(center = (iceman["x"] - cameraX, iceman["y"] - cameraY))
+            screen.blit(icemanSurface, rect)
+
+        for c in chargers[:]:
+            for img in c["chargeAfterimages"][:]:
+                img["alpha"] -= 12
+                if img["alpha"] <= 0:
+                    c["chargeAfterimages"].remove(img)
+
+            for img in c["chargeAfterimages"]:
+                chargerSurface.set_alpha(img["alpha"])
+                rect = chargerSurface.get_rect(center=(img["x"] - cameraX, img["y"] - cameraY))
+                screen.blit(chargerSurface, rect)
+
+            chargerSurface.set_alpha(255)
+            rect = chargerSurface.get_rect(center=(c["x"] - cameraX, c["y"] - cameraY))
+            screen.blit(chargerSurface, rect)
+
+        healthText = renderCachedText(hudTextCache, "health", font, f"Health: {health}", (255, 255, 255))
+        screen.blit(healthText, (20, 20))
+
+        enemiesLeftText = renderCachedText(hudTextCache, "enemiesLeft", font, f"Enemies Left: {len(enemies) + len(shooters) + len(chargers) + (1 if iceman is not None else 0)}", (255, 255, 255))
+        screen.blit(enemiesLeftText, (20 + healthText.get_width() + 30, 20))
+
+        waveText = renderCachedText(hudTextCache, "wave", font, f"Wave: {wave}", (255, 255, 255))
+        screen.blit(waveText, (20, 55))
+
+        moneyText = renderCachedText(hudTextCache, "money", font, f"Money: £{money}", (255, 255, 255))
+        screen.blit(moneyText, (20, 90))
+
+        if inIntermission:
+            secondsLeft = math.ceil(intermissionRemaining / 1000)
+            intermissionText = renderCachedText(hudTextCache, "intermission", font, f"Intermission: {secondsLeft}", (255, 255, 255))
+            screen.blit(intermissionText, intermissionText.get_rect(midtop=(screen.get_width() // 2, 55)))
+
+            timeSinceIntermissionStart = currentTime - intermissionStart
+            mousePos = pygame.mouse.get_pos()
+
+            for i in range(cardCount):
+                cardDelay = i * cardFadeInStagger
+
+                if timeSinceIntermissionStart < cardDelay:
+                    cardAlpha = 0
+                elif timeSinceIntermissionStart < cardDelay + cardFadeInDuration:
+                    fadeT = (timeSinceIntermissionStart - cardDelay) / cardFadeInDuration
+                    fadeT = easeOut(fadeT)
+                    cardAlpha = int(lerp(0, 255, fadeT))
+                else:
+                    cardAlpha = 255
+
+                if intermissionRemaining <= cardFadeOutDuration:
+                    outT = 1 - (intermissionRemaining / cardFadeOutDuration)
+                    outT = easeOut(outT)
+                    outAlpha = int(lerp(255, 0, outT))
+                    cardAlpha = min(cardAlpha, outAlpha)
+
+                hovering = cardRects[i].collidepoint(mousePos) and cardAlpha >= 255
+                targetScale = 1.15 if hovering else 1.0
+                cardScale[i] += (targetScale - cardScale[i]) * cardScaleSpeed
+
+                if cardAlpha > 0:
+                    upgradeId = currentIntermissionCards[i] if i < len(currentIntermissionCards) else None
+
+                    if upgradeId:
+                        owned = upgradeId in ownedUpgrades
+                        cacheKey = (upgradeId, owned)
+
+                        if cacheKey not in cardBaseSurfaces:
+                            upgradeInfo = upgradeDefinitions[upgradeId]
+                            cardBaseSurfaces[cacheKey] = buildCardSurface(
+                                cardWidth, cardHeight, cardTitleFont, cardBodyFont,
+                                name = upgradeInfo["name"], cost = upgradeInfo["cost"],
+                                descriptionLines = upgradeInfo["description"], owned = owned
+                            )
+
+                        blitScaledCard(screen, cardBaseSurfaces[cacheKey], cardRects[i], cardAlpha, cardScale[i])
+            saveButtonDelay = cardCount * cardFadeInStagger
+            if timeSinceIntermissionStart < saveButtonDelay:
+                saveButtonAlpha = 0
+            elif timeSinceIntermissionStart < saveButtonDelay + cardFadeInDuration:
+                fadeT = (timeSinceIntermissionStart - saveButtonDelay) / cardFadeInDuration
+                fadeT = easeOut(fadeT)
+                saveButtonAlpha = int(lerp(0, 255, fadeT))
+            else:
+                saveButtonAlpha = 255
+
+            if intermissionRemaining <= cardFadeOutDuration:
+                outT = 1 - (intermissionRemaining / cardFadeOutDuration)
+                outT = easeOut(outT)
+                outAlpha = int(lerp(255, 0, outT))
+                saveButtonAlpha = min(saveButtonAlpha, outAlpha)
+
+            saveButtonHovering = saveButtonRect.collidepoint(mousePos) and saveButtonAlpha >= 255
+            saveButtonTargetScale = 1.15 if saveButtonHovering else 1.0
+            saveButtonScale += (saveButtonTargetScale - saveButtonScale) * saveButtonScaleSpeed
+
+            if saveButtonAlpha > 0:
+                blitScaledCard(screen, saveButtonSurface, saveButtonRect, saveButtonAlpha, saveButtonScale)
+
+        if saveConfirmAlpha > 0:
+            saveConfirmSurface.set_alpha(saveConfirmAlpha)
+            confirmRect = saveConfirmSurface.get_rect(center=(saveButtonRect.centerx, saveButtonRect.bottom + 25))
+            screen.blit(saveConfirmSurface, confirmRect)
+            saveConfirmAlpha = max(0, saveConfirmAlpha - 4)
+
+        if screenFlashAlpha > 0:
+            screenFlashSurface.fill((255, 255, 255, int(screenFlashAlpha)))
+            screen.blit(screenFlashSurface, (0, 0))
+
+            screenFlashAlpha = max(0, screenFlashAlpha - screenFlashDecay)
+
+        if icemanActive and icemanBar is not None:
+            healthBar.drawBossBar(screen, icemanBar, iceman["hp"], currentTime)
+
+        if icemanDialoguePending and currentTime >= icemanDialogueTime:
+            icemanDialoguePending = False
+
+            icemanChoice = await pausedDialogue(
+                dialogue.createAnswerDialogue(
+                    screen, "Iceman", "I am Iceman.", 0.03,
+                    [("silent", "..."), ("ok", "Ok")]
+                )
+            )
+
+            icemanActive = True
+
+            pygame.mixer.music.load("Things/OST/IcemanTheme.ogg")
+            pygame.mixer.music.set_volume(mainMusicVolume)
+            pygame.mixer.music.play(-1)
+            
+            icemanModule.startIceman(iceman, pygame.time.get_ticks() - pausedTotal)
+            icemanBar = healthBar.createBossBar(
+                "Iceman",
+                iceman["max_hp"],
+                pygame.time.get_ticks() - pausedTotal
+            )
+
+        pygame.display.update()
+        clock.tick(60)
+        await asyncio.sleep(0)
