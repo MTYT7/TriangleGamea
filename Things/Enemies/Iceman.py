@@ -49,8 +49,12 @@ icemanFreezeOverdue = 5000
 
 
 def createIcemanSurface(size = icemanSize):
-    image = pygame.image.load(icemanImagePath).convert_alpha()
-    return pygame.transform.smoothscale(image, (int(size), int(size)))
+    intSize = int(size)
+    surface = pygame.Surface((intSize, intSize), pygame.SRCALPHA)
+    points = [(intSize / 2, 0), (intSize, intSize), (0, intSize)]
+    pygame.draw.polygon(surface, (153, 255, 255), points)
+    pygame.draw.polygon(surface, (255, 255, 255), points, width = max(3, int(intSize * 0.04)))
+    return surface
 
 
 def spawnIceman(playerX, playerY, speed):
